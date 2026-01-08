@@ -1,3 +1,4 @@
+import time
 import urllib
 from concurrent.futures._base import CancelledError, TimeoutError
 
@@ -1149,7 +1150,14 @@ async def vk_polling(vkuser: VkUser):
             session = VkSession(access_token=vkuser.token, driver=await get_driver(vkuser.token))
             api = API(session)
             lp = LongPoll(session, mode=10, version=4)
-            while VkUser.objects.filter(token=vkuser.token, is_polling=True).exists():
+            last_check = 0
+            while True:
+                now = time.time()
+                if now - last_check > 10: # Check if we need to poll updates for given user each 10 seconds.
+                    is_polling = VkUser.objects.filter(pk=vkuser.pk, is_polling=True).exists()
+                    if not is_polling:
+                        break
+                    last_check = now
                 data = await lp.wait()
                 log.warning(f'Longpoll id {vkuser.pk}: ' + str(data))
                 if data['updates']:
