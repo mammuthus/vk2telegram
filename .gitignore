@@ -1,10 +1,14 @@
 .idea/
 __pycache__/
-data/migrations/*
-!data/migrations/__init__.py
+data/migrations/__pycache__/
+data/migrations/*.pyc
 config.py
 *.pem
 env_file
+.env
+.env.*
+!.env.example
+DEPLOYMENT.local.md
 openssl_config
 venv/
 commands/

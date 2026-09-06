@@ -1,6 +1,3 @@
-version: '3'
-
-
 services:
   bot_local:
     build: .
@@ -11,9 +8,9 @@ services:
       options:
         max-size: "10M"
         max-file: "10"
-    restart: always
+    restart: "no"
     env_file:
-      - env_file
+      - .env
     labels:
       com.centurylinklabs.watchtower.enable: 'true'
     depends_on:

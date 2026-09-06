@@ -7,7 +7,7 @@ from config import API_VERSION, VK_APP_ID
 ENV_FILE_TEMPLATE = """
 POSTGRES_DB=tgvkbot
 POSTGRES_PASSWORD=postgres
-BOT_TOKEN=%(tg_token)s
+BOT_TOKEN=
 VK_APP_ID=%(vk_app_id)s
 ALLOWED_USER_IDS=%(allowed_user_ids)s
 """
