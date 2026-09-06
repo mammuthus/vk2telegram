@@ -108,3 +108,8 @@ class MessageMarkup(models.Model):
     chat_id = models.BigIntegerField()
 
     buttons = models.TextField(null=True, blank=True)
+
+
+class RelayState(models.Model):
+    manual_action_code = models.CharField(max_length=8, null=True, blank=True)
+    manual_action_timestamp = models.FloatField(null=True, blank=True)
