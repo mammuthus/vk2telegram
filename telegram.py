@@ -6,12 +6,74 @@ from aiohttp.client_exceptions import ContentTypeError
 from bot import *
 from config import *
 from vk_messages import vk_polling_tasks, vk_polling
+from metrics import metrics, start_metrics_server
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
+TASKS = []
+
 oauth_link = re.compile(
     'https://(oauth|api)\.vk\.com/blank\.html#access_token=([a-zA-Z0-9._-]*)&expires_in=[0-9]*&user_id=[0-9]*')
+
+
+def bootstrap_relay_configuration():
+    """Create the one explicit VK-to-Telegram mapping used by local relay mode."""
+    if not VK_ACCESS_TOKEN and not VK_TARGET_PEER_ID and not TELEGRAM_TARGET_CHAT_ID:
+        return False
+
+    if not VK_ACCESS_TOKEN or not VK_TARGET_PEER_ID:
+        raise RuntimeError('VK_ACCESS_TOKEN and VK_TARGET_PEER_ID must be set together')
+    if not DRY_RUN and not TELEGRAM_TARGET_CHAT_ID:
+        raise RuntimeError('TELEGRAM_TARGET_CHAT_ID is required unless DRY_RUN=true')
+
+    try:
+        target_peer_id = int(VK_TARGET_PEER_ID)
+        owner_id = int(RELAY_OWNER_TG_USER_ID)
+        target_chat_id = int(TELEGRAM_TARGET_CHAT_ID) if TELEGRAM_TARGET_CHAT_ID else None
+    except ValueError as error:
+        raise RuntimeError('Relay IDs must be integers') from error
+
+    owner, _ = TgUser.objects.update_or_create(
+        uid=owner_id,
+        defaults={'first_name': 'relay', 'last_name': None, 'username': None},
+    )
+    vkuser, created = VkUser.objects.get_or_create(
+        token=VK_ACCESS_TOKEN,
+        defaults={'owner': owner, 'is_polling': True},
+    )
+    if not created:
+        vkuser.owner = owner
+        vkuser.is_polling = True
+        vkuser.save()
+
+    if target_chat_id is not None:
+        vkchat, _ = VkChat.objects.get_or_create(cid=target_peer_id)
+        tgchat, _ = TgChat.objects.get_or_create(cid=target_chat_id)
+        forward = Forward.objects.filter(owner=owner, vkchat=vkchat).first()
+        if forward:
+            forward.tgchat = tgchat
+            forward.save()
+        else:
+            Forward.objects.create(owner=owner, vkchat=vkchat, tgchat=tgchat)
+
+    log.warning('Relay mode configured for VK peer %s; dry_run=%s', target_peer_id, DRY_RUN)
+    return vkuser
+
+
+async def start_relay_polling():
+    global TASKS
+    relay_vkuser = bootstrap_relay_configuration()
+    metrics.load_manual_action_state()
+    start_metrics_server()
+    log.warning('Prometheus metrics server listening on port 9102')
+    TASKS = vk_polling_tasks(relay_vkuser)
+
+
+async def on_startup(dispatcher):
+    await start_relay_polling()
+    me = await bot.get_me()
+    log.warning('Telegram authentication succeeded for bot id %s', me.id)
 
 
 async def get_pages_switcher(markup, page, pages):
@@ -970,7 +1032,15 @@ async def handle_chat_migration(msg: types.Message):
 
 
 if __name__ == '__main__':
-    TASKS = vk_polling_tasks()
-    asyncio.gather(*[task['task'] for task in TASKS])
-
-    executor.start_polling(dp)
+    if VK_ACCESS_TOKEN and VK_TARGET_PEER_ID:
+        try:
+            dp.loop.run_until_complete(start_relay_polling())
+            log.warning('Relay mode active: Telegram polling and update handlers are disabled')
+            dp.loop.run_forever()
+        except RuntimeError:
+            log.exception('Relay configuration is invalid')
+            raise
+    elif DRY_RUN:
+        log.warning('Dry-run is enabled without relay configuration; Telegram polling is disabled')
+    else:
+        executor.start_polling(dp, on_startup=on_startup)

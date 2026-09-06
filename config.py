@@ -25,6 +25,33 @@ CHROME_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36'}
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
+# Optional single-dialog relay mode for local observation and forwarding tests.
+VK_ACCESS_TOKEN = os.environ.get('VK_ACCESS_TOKEN', '')
+VK_TARGET_PEER_ID = os.environ.get('VK_TARGET_PEER_ID', '')
+TELEGRAM_TARGET_CHAT_ID = os.environ.get('TELEGRAM_TARGET_CHAT_ID', '')
+RELAY_OWNER_TG_USER_ID = os.environ.get('RELAY_OWNER_TG_USER_ID', '0')
+VK_BLOCKED_SENDER_IDS_RAW = os.environ.get('VK_BLOCKED_SENDER_IDS', '')
+
+
+def parse_vk_blocked_sender_ids(raw_value):
+    if not raw_value.strip():
+        return frozenset()
+
+    blocked_sender_ids = set()
+    for value in raw_value.split(','):
+        value = value.strip()
+        if not value:
+            raise RuntimeError('VK_BLOCKED_SENDER_IDS must contain only numeric IDs')
+        try:
+            blocked_sender_ids.add(int(value))
+        except ValueError as error:
+            raise RuntimeError('VK_BLOCKED_SENDER_IDS must contain only numeric IDs') from error
+    return frozenset(blocked_sender_ids)
+
+
+VK_BLOCKED_SENDER_IDS = parse_vk_blocked_sender_ids(VK_BLOCKED_SENDER_IDS_RAW)
+DRY_RUN = os.environ.get('DRY_RUN', '').lower() in ('1', 'true', 'yes', 'on')
+
 SETTINGS_VAR = os.environ.get('SETTINGS_VAR', 'DJANGO_TGVKBOT_SETTINGS_MODULE')
 
 MAX_FILE_SIZE = os.environ.get('MAX_FILE_SIZE', 52428800)

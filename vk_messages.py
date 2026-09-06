@@ -7,6 +7,7 @@ from aiovk.longpoll import LongPoll
 from aiogram.utils.exceptions import MessageError
 
 from bot import *
+from metrics import metrics
 
 log = logging.getLogger('vk_messages')
 inline_link_re = re.compile('\[([a-zA-Z0-9_]*)\|(.*?)\]', re.MULTILINE)
@@ -246,6 +247,7 @@ class Attachment(object):
 
 
 MAX_LENGHT = 4000
+MAX_CAPTION_LENGTH = 1024
 
 from math import ceil
 
@@ -469,7 +471,8 @@ async def check_event(api, user_id, chat_id, attaches):
     return False
 
 
-async def process_longpoll_event(api, new_event):
+async def process_longpoll_event(api, new_event, known_users=None, known_chats=None):
+    metrics.incoming_event()
     if not new_event:
         return
 
@@ -504,6 +507,15 @@ async def process_longpoll_event(api, new_event):
 
         data.is_out = True
 
+    peer_id = int(new_event[3])
+    if VK_TARGET_PEER_ID and peer_id != int(VK_TARGET_PEER_ID):
+        log.info('Ignoring VK event from peer_id=%s; target peer_id=%s', peer_id, VK_TARGET_PEER_ID)
+        return
+    if data.user_id in VK_BLOCKED_SENDER_IDS:
+        metrics.blocked_message()
+        log.warning('Skipping VK message from blocked sender_id=%s', data.user_id)
+        return
+
     data.full_text = new_event[5].replace('<br>', '\n')
 
     if "fwd" in data.attaches:
@@ -515,10 +527,17 @@ async def process_longpoll_event(api, new_event):
 
     msg = LPMessage(api, data)
 
+    log.warning('Incoming VK Long Poll event peer_id=%s message_id=%s', msg.peer_id, msg.msg_id)
+    if VK_TARGET_PEER_ID:
+        log.warning('Target VK message received peer_id=%s message_id=%s', msg.peer_id, msg.msg_id)
+    if DRY_RUN:
+        log.warning('Dry-run: not fetching or forwarding VK message_id=%s', msg.msg_id)
+        return
+
     if await check_event(api, data.user_id, data.chat_id, data.attaches):
         msg.is_event = True
 
-    await process_message(msg)
+    await process_message(msg, known_users=known_users, known_chats=known_chats)
 
 
 #######################################################################################################################
@@ -527,12 +546,15 @@ async def process_longpoll_event(api, new_event):
 async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, user_id=None, forward_settings=None,
                           vkchat=None,
                           full_msg=None, forwarded=False, vk_msg_id=None, main_message=None, known_users=None,
-                          force_disable_notify=None, full_chat=None):
+                          force_disable_notify=None, full_chat=None, known_chats=None):
     token = token or msg.api._session.access_token
     is_multichat = is_multichat or msg.is_multichat
     vk_msg_id = vk_msg_id or msg.msg_id
     user_id = user_id or msg.user_id
-    known_users = known_users or {}
+    if known_users is None:
+        known_users = {}
+    if known_chats is None:
+        known_chats = {}
     header_message = None
 
     vkuser = VkUser.objects.filter(token=token).first()
@@ -557,8 +579,10 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
     full_msg = full_msg or await msg.api('messages.getById', message_ids=', '.join(str(x) for x in [vk_msg_id]))
 
     # Узнаем title чата
-    if is_multichat:
-        full_chat = await msg.api('messages.getChat', chat_id=vk_chat_id - 2000000000)
+    if is_multichat and full_chat is None:
+        if vk_chat_id not in known_chats:
+            known_chats[vk_chat_id] = await msg.api('messages.getChat', chat_id=vk_chat_id - 2000000000)
+        full_chat = known_chats[vk_chat_id]
     if full_msg.get('items'):
         for vk_msg in full_msg['items']:
             # Формируем ссылку на сообщение на случай ошибки
@@ -591,17 +615,10 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                 else:
                     attaches_scheme.append({'content': [location[0], location[1]], 'type': 'location'})
             name = first_name + ((' ' + last_name) if last_name else '')
+            header = '<b>{}</b> написал:\n\n'.format(quote_html(name))
             if forward_setting:
-                if forwarded or is_multichat:
-                    header = f'<b>{name}</b>' + '\n'
-                elif not forwarded:
-                    header = ''
                 to_tg_chat = forward_setting.tgchat.cid
             else:
-                if forwarded or not is_multichat:
-                    header = f'<b>{name}</b>' + '\n'
-                elif is_multichat:
-                    header = f'<b>{name} @ {quote_html(full_chat["title"])}</b>' + '\n'
                 to_tg_chat = vkuser.owner.uid
 
             # Логика реплая на сообщение, которое уже есть в чате
@@ -645,7 +662,9 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                 #     if first_voice_attach.get('transcript_state') != 'done':
                 #         return
 
-            if body_parts:
+            photo_attachments = [attach for attach in attaches_scheme if attach and attach['type'] == 'photo']
+
+            if not photo_attachments and body_parts:
                 for body_part in range(len(body_parts)):
                     m = inline_link_re.finditer(body_parts[body_part])
                     for i in m:
@@ -659,12 +678,12 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                     except:
                         return
                     try:  # Чтобы не падало при реплае на сообщение из чата внутри ТГ
-                        tg_message = await bot.send_message(vkuser.owner.uid, body_parts[body_part],
+                        tg_message = await bot.send_message(to_tg_chat, body_parts[body_part],
                                                             parse_mode=ParseMode.HTML,
                                                             reply_to_message_id=main_message,
                                                             disable_notification=disable_notify)
                     except MessageError:  # Надо бы обновить aiogram, чтобы можно было ловить MessageToReplyNotFound
-                        tg_message = await bot.send_message(vkuser.owner.uid, body_parts[body_part],
+                        tg_message = await bot.send_message(to_tg_chat, body_parts[body_part],
                                                             parse_mode=ParseMode.HTML,
                                                             reply_to_message_id=None,
                                                             disable_notification=disable_notify)
@@ -672,13 +691,14 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                         header_message = tg_message
                         if forwarded:
                             main_message = header_message.message_id
+                    metrics.forwarded_message()
                     Message.objects.create(
                         vk_chat=vk_chat_id,
                         vk_id=vk_msg_id,
                         tg_chat=tg_message.chat.id,
                         tg_id=tg_message.message_id
                     )
-            elif not body_parts and (header + body):
+            elif not photo_attachments and not body_parts and (header + body):
                 m = inline_link_re.finditer(body)
                 for i in m:
                     vk_url = f'https://vk.com/{i.group(1)}'
@@ -701,21 +721,41 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                                                                          disable_notification=disable_notify)
                 if forwarded:
                     main_message = header_message.message_id
+                metrics.forwarded_message()
                 Message.objects.create(
                     vk_chat=vk_chat_id,
                     vk_id=vk_msg_id,
                     tg_chat=tg_message.chat.id,
                     tg_id=tg_message.message_id
                 )
+                log.info('Forwarded VK message_id=%s to Telegram chat_id=%s', vk_msg_id, to_tg_chat)
 
-            photo_attachments = [attach for attach in attaches_scheme if attach and attach['type'] == 'photo']
+            if photo_attachments:
+                caption_text = ''.join(body_parts) if body_parts else header + body
+                caption_parts = safe_split_text(caption_text, MAX_CAPTION_LENGTH) if caption_text else []
+                caption = caption_parts[0] if caption_parts else None
+                tg_messages = []
 
-            if len(photo_attachments) > 1:
-                media = MediaGroup()
-                for photo in photo_attachments:
-                    media.attach_photo(photo['content'])
-                tg_messages = await tgsend(bot.send_media_group, to_tg_chat, media, reply_to_message_id=main_message,
-                                           disable_notification=disable_notify, vk_msg_url=vk_msg_url)
+                if len(photo_attachments) == 1:
+                    photo = photo_attachments[0]
+                    await bot.send_chat_action(to_tg_chat, ChatActions.UPLOAD_PHOTO)
+                    tg_message = await tgsend(bot.send_photo, to_tg_chat, photo['content'], caption=caption,
+                                              parse_mode=ParseMode.HTML, reply_to_message_id=main_message,
+                                              disable_notification=disable_notify, vk_msg_url=vk_msg_url)
+                    if tg_message:
+                        tg_messages = [tg_message]
+                    cleanup_attachment_file(photo)
+                else:
+                    media = MediaGroup()
+                    for index, photo in enumerate(photo_attachments):
+                        media.attach_photo(photo['content'], caption=caption if index == 0 else None,
+                                           parse_mode=ParseMode.HTML if index == 0 else None)
+                    tg_messages = await tgsend(bot.send_media_group, to_tg_chat, media,
+                                               reply_to_message_id=main_message, disable_notification=disable_notify,
+                                               vk_msg_url=vk_msg_url) or []
+                    for photo in photo_attachments:
+                        cleanup_attachment_file(photo)
+
                 for tg_message in tg_messages:
                     Message.objects.create(
                         vk_chat=vk_chat_id,
@@ -723,19 +763,28 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                         tg_chat=tg_message.chat.id,
                         tg_id=tg_message.message_id
                     )
+                if tg_messages:
+                    header_message = tg_messages[0]
+                    for caption_part in caption_parts[1:]:
+                        tg_message = await tgsend(bot.send_message, to_tg_chat, caption_part,
+                                                  parse_mode=ParseMode.HTML,
+                                                  reply_to_message_id=header_message.message_id,
+                                                  disable_notification=disable_notify, vk_msg_url=vk_msg_url)
+                        if tg_message:
+                            Message.objects.create(
+                                vk_chat=vk_chat_id,
+                                vk_id=vk_msg_id,
+                                tg_chat=tg_message.chat.id,
+                                tg_id=tg_message.message_id
+                            )
 
             for attachment in attaches_scheme:
-                if attachment:
+                if attachment and attachment['type'] != 'photo':
                     tg_message = None
                     if attachment['type'] == 'text':
                         await bot.send_chat_action(to_tg_chat, ChatActions.TYPING)
                         tg_message = await tgsend(bot.send_message, to_tg_chat, attachment['content'],
                                                   parse_mode=ParseMode.HTML, reply_to_message_id=main_message,
-                                                  disable_notification=disable_notify, vk_msg_url=vk_msg_url)
-                    elif attachment['type'] == 'photo' and len(photo_attachments) == 1:
-                        await bot.send_chat_action(to_tg_chat, ChatActions.UPLOAD_PHOTO)
-                        tg_message = await tgsend(bot.send_photo, to_tg_chat, attachment['content'],
-                                                  reply_to_message_id=main_message,
                                                   disable_notification=disable_notify, vk_msg_url=vk_msg_url)
                     elif attachment['type'] == 'document':
                         await bot.send_chat_action(to_tg_chat, ChatActions.UPLOAD_DOCUMENT)
@@ -833,14 +882,16 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                                                       vkchat=vkchat,
                                                       full_msg={'items': [fwd_message]}, forwarded=True,
                                                       main_message=header_message.message_id if header_message else None,
-                                                      known_users=known_users, force_disable_notify=disable_notify)
+                                                      known_users=known_users, force_disable_notify=disable_notify,
+                                                      known_chats=known_chats)
                     else:
                         await process_message(msg, token=token, is_multichat=is_multichat, vk_chat_id=vk_chat_id,
                                               user_id=fwd_message['from_id'],
                                               forward_settings=forward_settings, vk_msg_id=vk_msg_id, vkchat=vkchat,
                                               full_msg={'items': [fwd_message]}, forwarded=True,
                                               main_message=header_message.message_id if header_message else None,
-                                              known_users=known_users, force_disable_notify=disable_notify)
+                                              known_users=known_users, force_disable_notify=disable_notify,
+                                              known_chats=known_chats)
 
 
 async def get_name(identifier, api):
@@ -857,31 +908,20 @@ async def get_name(identifier, api):
 
 
 async def tgsend(method, *args, **kwargs):
-    vk_msg_url = kwargs.pop('vk_msg_url', 0)
+    kwargs.pop('vk_msg_url', None)
     try:
         tg_message = await method(*args, **kwargs)
+        log.info('Telegram forwarding succeeded for chat_id=%s', args[0])
+        metrics.forwarded_message()
         return tg_message
     except RetryAfter as e:
+        metrics.forward_error('rate_limit')
         await asyncio.sleep(e.timeout)
-        await tgsend(method, *args, **kwargs)
-    except Exception:
+        return await tgsend(method, *args, **kwargs)
+    except Exception as error:
+        metrics.forward_error(error.__class__.__name__.lower())
         log.exception(msg='Error in message sending', exc_info=True)
-
-    await tgsend_error_report(args[0], vk_msg_url)
-
-
-async def tgsend_error_report(chat_id, vk_msg_url):
-    try:
-        text = '<i>Ошибка отправки сообщения VK → Telegram</i>'
-        if vk_msg_url:
-            text += '\n' + f'<a href="{vk_msg_url}">Сообщение</a>'
-        await bot.send_message(chat_id, text=text, parse_mode='HTML')
-    except RetryAfter as e:
-        await asyncio.sleep(e.timeout)
-        await tgsend_error_report(chat_id, vk_msg_url)
-    except Exception:
-        log.exception(msg='Error in message sending report', exc_info=True)
-        pass
+        return None
 
 
 async def process_event(msg):
@@ -916,11 +956,28 @@ def search_max_vk_photo_size(sizes: list) -> dict:
     return list(sorted(sizes, key=lambda x: (int(x.get('width', 0)), int(x.get('height', 0))), reverse=True))[0]
 
 
+def cleanup_attachment_file(attachment):
+    content = attachment.get('content')
+    try:
+        content.close()
+    except AttributeError:
+        pass
+    try:
+        os.remove(os.path.join(attachment['temp_path'], attachment['file_name'] + attachment['custom_ext']))
+    except (KeyError, OSError):
+        pass
+
+
 async def process_attachment(attachment, token=None, vk_msg_url=None):
     atype = attachment.get('type')
     if atype == 'photo':
         photo_url = search_max_vk_photo_size(attachment[atype]['sizes'])['url']
-        return {'content': photo_url, 'type': 'photo'}
+        content = await get_content(photo_url, docname='tgvkbot.photo')
+        if 'content' not in content:
+            log.error('Unable to download VK photo attachment for Telegram forwarding')
+            return None
+        content['type'] = 'photo'
+        return content
 
     elif atype == 'audio_message':
         voice_url = attachment[atype]['link_ogg']
@@ -1145,11 +1202,15 @@ async def process_attachment(attachment, token=None, vk_msg_url=None):
 
 async def vk_polling(vkuser: VkUser):
     log.warning('Starting polling for: id ' + str(vkuser.pk))
+    known_users = {}
+    known_chats = {}
     while True:
         try:
             session = VkSession(access_token=vkuser.token, driver=await get_driver(vkuser.token))
             api = API(session)
+            log.warning('Acquiring VK Long Poll server for id %s', vkuser.pk)
             lp = LongPoll(session, mode=10, version=4)
+            longpoll_connected = False
             last_check = 0
             while True:
                 now = time.time()
@@ -1159,37 +1220,92 @@ async def vk_polling(vkuser: VkUser):
                         break
                     last_check = now
                 data = await lp.wait()
-                log.warning(f'Longpoll id {vkuser.pk}: ' + str(data))
+                metrics.longpoll_response()
+                metrics.clear_manual_action()
+                if not longpoll_connected:
+                    log.warning('VK Long Poll connected for id %s', vkuser.pk)
+                    log.warning('VK authentication succeeded for id %s', vkuser.pk)
+                    longpoll_connected = True
+                    metrics.set_longpoll_connected(True)
+                log.debug('VK Long Poll response for id %s contains %s updates', vkuser.pk, len(data.get('updates', [])))
                 if data['updates']:
                     for update in data['updates']:
-                        await process_longpoll_event(api, update)
+                        await process_longpoll_event(api, update, known_users, known_chats)
             break
-        except VkLongPollError:
-            log.error('Longpoll error! {}'.format(vkuser.pk))
+        except VkLongPollError as error:
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error('longpoll')
+            log.warning('VK Long Poll error for id %s; reconnecting in 5 seconds: %s', vkuser.pk, error)
             await asyncio.sleep(5)
-        except VkAuthError:
-            log.error('Auth Error! {}'.format(vkuser.pk))
+        except VkAuthError as error:
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error(5)
+            metrics.set_manual_action(5)
+            log.error('VK authorization failure for id %s: %s', vkuser.pk, error)
+            vkuser.is_polling = False
+            vkuser.save()
+            break
+        except VkCaptchaNeeded as error:
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error(14)
+            metrics.set_manual_action(14)
+            log.error('VK CAPTCHA challenge detected; polling stopped for manual resolution: captcha_sid=%s captcha_img=%s',
+                      error.sid, error.url)
             vkuser.is_polling = False
             vkuser.save()
             break
         except TimeoutError:
-            log.warning('Polling timeout')
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error('timeout')
+            log.warning('VK Long Poll timeout for id %s; reconnecting in 5 seconds', vkuser.pk)
             await asyncio.sleep(5)
         except CancelledError:
             log.warning('Stopped polling for id: ' + str(vkuser.pk))
             break
         except aiohttp.client_exceptions.ServerDisconnectedError:
-            log.warning('Longpoll server disconnected id: ' + str(vkuser.pk))
-        except VkAPIError:
-            # Invalid/Inaccessible token
-            pass
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error('network')
+            log.warning('VK Long Poll server disconnected id %s; reconnecting in 5 seconds', vkuser.pk)
+            await asyncio.sleep(5)
+        except VkAPIError as error:
+            error_code = getattr(error, 'code', None) or getattr(error, 'error_code', None)
+            error_message = getattr(error, 'error_msg', None) or str(error)
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error(error_code)
+            log.error('VK API error for id %s: code=%s message=%s', vkuser.pk, error_code, error_message)
+            if error_code == 14:
+                metrics.set_manual_action(14)
+                log.error('VK CAPTCHA challenge detected; polling stopped for manual resolution')
+                vkuser.is_polling = False
+                vkuser.save()
+                break
+            if error_code == 5:
+                metrics.set_manual_action(5)
+                log.error('VK token authorization failed or was revoked; polling stopped')
+                vkuser.is_polling = False
+                vkuser.save()
+                break
+            if error_code in (17, 25):
+                metrics.set_manual_action(error_code)
+                log.error('VK API error code %s requires manual action; polling stopped: %s',
+                          error_code, error_message)
+                vkuser.is_polling = False
+                vkuser.save()
+                break
+            log.warning('VK API error is retryable; reconnecting in 5 seconds')
+            await asyncio.sleep(5)
         except Exception:
+            metrics.set_longpoll_connected(False)
+            metrics.vk_error('unexpected')
             log.exception(msg='Error in longpolling', exc_info=True)
             await asyncio.sleep(5)
 
 
-def vk_polling_tasks():
-    tasks = [{'token': vkuser.token, 'task': asyncio.ensure_future(vk_polling(vkuser))} for vkuser in
-             VkUser.objects.filter(token__isnull=False, is_polling=True)]
+def vk_polling_tasks(relay_vkuser=None):
+    if relay_vkuser:
+        vkusers = [relay_vkuser]
+    else:
+        vkusers = VkUser.objects.filter(token__isnull=False, is_polling=True)
+    tasks = [{'token': vkuser.token, 'task': asyncio.ensure_future(vk_polling(vkuser))} for vkuser in vkusers]
     log.warning('Starting Vk polling')
     return tasks
