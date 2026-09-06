@@ -17,7 +17,7 @@ services:
         max-file: "10"
 
   db:
-    image: postgres:9-alpine
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tgvkbot}

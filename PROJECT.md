@@ -163,9 +163,9 @@ increase(tgvk_forward_errors_total[5m]) > 0
 
 # Database
 
-The current Compose files use `postgres:9-alpine`. This is a historical image choice, not a hard requirement of Django 2.0.4, `psycopg2-binary==2.7.4`, or the current migrations. The schema uses basic Django fields, foreign keys, indexes, and standard PostgreSQL types, all compatible with PostgreSQL 14, 15, and 16.
+The current Compose files use `postgres:16-alpine`. This is not a hard requirement of Django 2.0.4, `psycopg2-binary==2.7.4`, or the current migrations. The schema uses basic Django fields, foreign keys, indexes, and standard PostgreSQL types.
 
-PostgreSQL 9 is end-of-life. A major-version upgrade requires a tested logical dump/restore or `pg_upgrade` plan, backup verification, an application-image compatibility check, and rollback preparation. Do not replace the production database image in place: existing data directories cannot be mounted directly across major PostgreSQL versions. PostgreSQL 16 is the preferred supported target because it has the longest remaining support window of 14, 15, and 16; all three are schema-compatible, but the legacy Python 3.6/Django 2.0/psycopg2 stack requires the same staged compatibility test.
+PostgreSQL 9 is end-of-life. A major-version upgrade requires a tested logical dump/restore or `pg_upgrade` plan, backup verification, an application-image compatibility check, and rollback preparation. Do not replace a database image in place: existing data directories cannot be mounted directly across major versions. PostgreSQL 16 is the supported deployment target. The legacy Python 3.6/Django 2.0/psycopg2 stack must pass the same staged compatibility test before any future major PostgreSQL upgrade.
 
 The relay uses these Django models:
 
@@ -224,7 +224,7 @@ The aiovk limiter of one request per 0.4 seconds exists in both upstream and cur
 
 # Known limitations
 
-- Legacy Python 3.6, aiovk 1.3.0, aiogram 1.2.2, Django 2.0.4, PostgreSQL 9, and old pinned dependencies remain in use.
+- Legacy Python 3.6, aiovk 1.3.0, aiogram 1.2.2, Django 2.0.4, PostgreSQL 16, and old pinned dependencies remain in use.
 - A real VK user token can be revoked or require CAPTCHA/validation.
 - One worker only: no HA, queue, or durable replay pipeline.
 - Long Poll processes new events only; it does not continuously replay history.
