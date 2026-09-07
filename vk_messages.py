@@ -13,6 +13,37 @@ log = logging.getLogger('vk_messages')
 inline_link_re = re.compile('\[([a-zA-Z0-9_]*)\|(.*?)\]', re.MULTILINE)
 
 
+def format_sender_header(name, is_wall_repost=False):
+    suffix = ' (репост)' if is_wall_repost else ''
+    return '<b>{}</b>{}:\n\n'.format(quote_html(name), suffix)
+
+
+def wall_post_url(wall):
+    owner_id = wall.get('owner_id') or wall.get('from_id') or wall.get('to_id')
+    post_id = wall.get('id')
+    if owner_id is None or post_id is None:
+        return None
+    if not str(owner_id).lstrip('-').isdigit() or not str(post_id).isdigit():
+        return None
+    return 'https://vk.com/wall{}_{}'.format(owner_id, post_id)
+
+
+def format_wall_post(wall):
+    text = quote_html(wall.get('text') or '')
+    link = wall_post_url(wall)
+    parts = [text] if text.strip() else []
+
+    source = wall.get('copyright') or {}
+    source_name = source.get('name') if isinstance(source, dict) else None
+    if source_name:
+        parts.append('<i>{}</i>'.format(quote_html(source_name)))
+    if not parts:
+        return '📰 Запись на стене'
+    if link:
+        parts.append('<a href="{}">Открыть запись</a>'.format(link))
+    return '\n\n'.join(parts)
+
+
 ################### Честно взято по лицензии https://github.com/vk-brain/sketal/blob/master/LICENSE ###################
 
 def parse_msg_flags(bitmask, keys=('unread', 'outbox', 'replied', 'important', 'chat',
@@ -602,10 +633,7 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
 
             vk_msg_url = f'https://vk.com/im?msgid={vk_msg_url_msg_id}&sel={vk_msg_url_chat_id}'
             disable_notify = force_disable_notify or bool(vk_msg.get('push_settings', False))
-            attaches_scheme = []
-            if vk_msg.get('attachments'):
-                attaches_scheme = [await process_attachment(attachment, token, vk_msg_url) for attachment in
-                                   vk_msg['attachments']]
+            attaches_scheme = await process_attachments(vk_msg.get('attachments', []), token, vk_msg_url)
             if vk_msg.get('geo'):
                 location = vk_msg['geo']['coordinates']['latitude'], vk_msg['geo']['coordinates']['longitude']
                 is_venue = vk_msg['geo'].get('place')
@@ -615,7 +643,8 @@ async def process_message(msg, token=None, is_multichat=None, vk_chat_id=None, u
                 else:
                     attaches_scheme.append({'content': [location[0], location[1]], 'type': 'location'})
             name = first_name + ((' ' + last_name) if last_name else '')
-            header = '<b>{}</b> написал:\n\n'.format(quote_html(name))
+            is_wall_repost = any(attachment.get('type') == 'wall' for attachment in vk_msg.get('attachments', []))
+            header = format_sender_header(name, is_wall_repost)
             if forward_setting:
                 to_tg_chat = forward_setting.tgchat.cid
             else:
@@ -1182,12 +1211,7 @@ async def process_attachment(attachment, token=None, vk_msg_url=None):
         return {'content': photo_content + title + count + '\n', 'type': 'text'}
 
     elif atype == 'wall':
-        owner_id = attachment[atype].get('owner_id', '') or attachment[atype].get('from_id', '') or attachment[
-            atype].get('to_id', '')
-        post_id = attachment[atype]['id']
-        # access_key = attachment[atype].get('access_key')
-        wall_url = f'https://vk.com/wall{owner_id}_{post_id}'  # + f'_{access_key}' if access_key else ''
-        return {'content': f'<a href="{wall_url}">📰 Запись на стене</a>', 'type': 'text'}
+        return {'content': format_wall_post(attachment[atype]), 'type': 'text'}
 
     elif atype == 'wall_reply':
         owner_id = attachment[atype].get('owner_id', '') or attachment[atype].get('from_id', '') or attachment[
@@ -1198,6 +1222,19 @@ async def process_attachment(attachment, token=None, vk_msg_url=None):
         if reply_text:
             reply_text = '\n' + reply_text
         return {'content': f'<a href="{wall_reply_url}">💬 Комментарий к записи</a>{reply_text}', 'type': 'text'}
+
+
+async def process_attachments(attachments, token=None, vk_msg_url=None):
+    result = []
+    for attachment in attachments:
+        if attachment.get('type') != 'wall':
+            result.append(await process_attachment(attachment, token, vk_msg_url))
+            continue
+
+        wall = attachment.get('wall') or {}
+        result.append({'content': format_wall_post(wall), 'type': 'text'})
+        result.extend(await process_attachments(wall.get('attachments', []), token, wall_post_url(wall)))
+    return result
 
 
 async def vk_polling(vkuser: VkUser):
